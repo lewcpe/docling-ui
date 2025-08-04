@@ -1,0 +1,188 @@
+services:
+  # Test PostgreSQL Database
+  test-postgres:
+    image: postgres:16
+    container_name: docling-test-postgres
+    environment:
+      POSTGRES_DB: docling_test
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./backend/database/test-init:/docker-entrypoint-initdb.d
+      - ./cypress/fixtures/test-data.sql:/docker-entrypoint-initdb.d/99-test-data.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d docling_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Test Redis
+  test-redis:
+    image: redis:7-alpine
+    container_name: docling-test-redis
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Test Backend
+  test-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.test
+    container_name: docling-test-backend
+    environment:
+      DATABASE_URL: postgresql://test_user:test_pass@test-postgres:5432/docling_test
+      REDIS_URL: redis://test-redis:6379
+      DOCLING_API_URL: http://mock-docling:8080
+      SECRET_KEY: test-secret-key
+      ENVIRONMENT: testing
+      TESTING: true
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./backend:/app
+      - test_uploads:/app/uploads
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy
+      mock-docling:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Test Worker
+  test-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: docling-test-worker
+    command: celery -A app.worker worker --loglevel=info --concurrency=1
+    environment:
+      DATABASE_URL: postgresql://test_user:test_pass@test-postgres:5432/docling_test
+      REDIS_URL: redis://test-redis:6379
+      DOCLING_API_URL: http://mock-docling:8080
+      SECRET_KEY: test-secret-key
+      ENVIRONMENT: testing
+      TESTING: true
+    volumes:
+      - ./backend:/app
+      - test_uploads:/app/uploads
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy
+      mock-docling:
+        condition: service_healthy
+    # No health check for Celery worker
+
+  # Test Frontend
+  test-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.test
+    container_name: docling-test-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://test-backend:8000
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: test-nextauth-secret
+      NODE_ENV: test
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      test-backend:
+        condition: service_healthy
+    profiles:
+      - test-frontend
+
+  # Mock Docling API for testing
+  mock-docling:
+    build:
+      context: ./cypress/mocks
+      dockerfile: Dockerfile
+    container_name: docling-mock-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./cypress/mocks:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Cypress Test Runner
+  cypress:
+    image: cypress/included:13.6.0
+    container_name: docling-cypress
+    working_dir: /e2e
+    volumes:
+      - ./cypress:/e2e
+      - ./cypress/videos:/e2e/videos
+      - ./cypress/screenshots:/e2e/screenshots
+    environment:
+      CYPRESS_BASE_URL: http://test-frontend:3000
+      CYPRESS_API_URL: http://test-backend:8000
+      CYPRESS_MOCK_DOCLING_URL: http://mock-docling:8080
+      CYPRESS_TEST_USER_EMAIL: test@example.com
+      CYPRESS_TEST_API_KEY: test-api-key-123
+    depends_on:
+      #test-frontend:
+      #  condition: service_started
+      test-backend:
+        condition: service_healthy
+      mock-docling:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Waiting for services to be ready...' &&
+        sleep 10 &&
+        npx cypress run --config video=true,screenshotOnRunFailure=true
+      "
+
+  # Cypress Interactive Mode (for development)
+  cypress-open:
+    image: cypress/included:13.6.0
+    container_name: docling-cypress-open
+    working_dir: /e2e
+    volumes:
+      - ./cypress:/e2e
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      DISPLAY: ${DISPLAY}
+      CYPRESS_BASE_URL: http://test-frontend:3000
+      CYPRESS_API_URL: http://test-backend:8000
+      CYPRESS_MOCK_DOCLING_URL: http://mock-docling:8080
+      CYPRESS_TEST_USER_EMAIL: test@example.com
+      CYPRESS_TEST_API_KEY: test-api-key-123
+    depends_on:
+      test-frontend:
+        condition: service_started
+      test-backend:
+        condition: service_healthy
+      mock-docling:
+        condition: service_healthy
+    command: npx cypress open --config baseUrl=http://test-frontend:3000
+    profiles:
+      - interactive
+
+volumes:
+  test_uploads:
+
+networks:
+  default:
+    name: docling-test-network

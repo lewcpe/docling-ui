@@ -1,0 +1,129 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16
+    container_name: docling-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-docling_processor}
+      POSTGRES_USER: ${POSTGRES_USER:-docling_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docling_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/database/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docling_user} -d ${POSTGRES_DB:-docling_processor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Queue Management
+  redis:
+    image: redis:7-alpine
+    container_name: docling-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: docling-backend
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-docling_user}:${POSTGRES_PASSWORD:-docling_pass}@postgres:5432/${POSTGRES_DB:-docling_processor}
+      REDIS_URL: redis://redis:6379
+      DOCLING_API_URL: ${DOCLING_API_URL:-http://localhost:8080}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - backend_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Background Workers
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: docling-worker
+    command: celery -A app.worker worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-docling_user}:${POSTGRES_PASSWORD:-docling_pass}@postgres:5432/${POSTGRES_DB:-docling_processor}
+      REDIS_URL: redis://redis:6379
+      DOCLING_API_URL: ${DOCLING_API_URL:-http://localhost:8080}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - ./backend:/app
+      - backend_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: docling-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-dev-nextauth-secret}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+  # Nginx with OAuth2-proxy
+  nginx:
+    build:
+      context: ./infrastructure/nginx
+      dockerfile: Dockerfile
+    container_name: docling-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - frontend
+      - backend
+    environment:
+      FRONTEND_HOST: frontend:3000
+      BACKEND_HOST: backend:8000
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_uploads:
+
+networks:
+  default:
+    name: docling-network
